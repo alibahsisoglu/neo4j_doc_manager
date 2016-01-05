@@ -72,21 +72,34 @@ class DocManager(DocManagerBase):
 
   @wrap_exceptions
   def bulk_upsert(self, docs, namespace, timestamp):
-    """Insert multiple documents into Neo4j."""
-    """Maximum chunk size is 1000. Transaction blocks won't have more than 1000 statements."""
-    metadata = { "_ts": timestamp }
-    tx = self.graph.cypher.begin()
-    for doc in docs:
-      index, doc_type = self._index_and_mapping(namespace)
-      doc_id = u(doc.pop("_id"))
-      doc = self._formatter.format_document(doc)
-      builder = NodesAndRelationshipsBuilder(doc, doc_type, doc_id, metadata)
-      self.apply_id_constraint(builder.doc_types)
-      for statement in builder.query_nodes.keys():
-        tx.append(statement, builder.query_nodes[statement])
-      for relationship in builder.relationships_query.keys():
-        tx.append(relationship, builder.relationships_query[relationship])
-    tx.commit()
+    def iterate_chunks():
+        more_chunks = True
+
+        while more_chunks:
+            tx = self.graph.cypher.begin()
+            metadata = { "_ts": timestamp }
+            for i in range(self.chunk_size):
+                try:
+                    doc = next(docs)
+                    index, doc_type = self._index_and_mapping(namespace)
+                    doc_id = u(doc.pop("_id"))
+                    doc = self._formatter.format_document(doc)
+                    builder = NodesAndRelationshipsBuilder(doc, doc_type, doc_id, metadata)
+                    self.apply_id_constraint(builder.doc_types)
+                    for statement in builder.query_nodes.keys():
+                        tx.append(statement, builder.query_nodes[statement])
+                    for relationship in builder.relationships_query.keys():
+                        tx.append(relationship, builder.relationships_query[relationship])
+                except StopIteration:
+                    more_chunks = False
+                    if i > 0:
+                        yield tx
+                    break
+            if more_chunks:
+                yield tx
+
+    for tx in iterate_chunks():
+        tx.commit()
 
   @wrap_exceptions
   def update(self, document_id, update_spec, namespace, timestamp):
